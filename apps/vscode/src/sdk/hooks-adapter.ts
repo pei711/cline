@@ -2,14 +2,15 @@
 //
 // Runtime hooks use typed in-process lifecycle callbacks:
 //   TaskStart        -> beforeRun
+//   TaskResume       -> beforeRun after an aborted run
 //   UserPromptSubmit -> beforeRun with the latest submitted user message
 //   PreToolUse       -> beforeTool
 //   PostToolUse      -> afterTool
 //   TaskComplete     -> afterRun when completed
 //   TaskCancel       -> afterRun when aborted
 //
-// Deferred hooks (NOT wired here): TaskResume, TaskError, SessionShutdown,
-// PreCompact, Notification.
+// Deferred hooks (NOT wired here): TaskError, SessionShutdown, PreCompact,
+// Notification.
 
 import type {
 	AgentAfterToolContext,
@@ -127,18 +128,26 @@ export function buildAgentHooks(
 	// window's workspace folders (e.g. the chat-workspace fallback when no
 	// folder is open), so the factory also scans this session's own workspace.
 	const createFactory = () => new HookFactory({ sessionWorkspaceRoot })
+	let hasStarted = false
+	let wasAborted = false
 
 	return {
 		async beforeRun(ctx: AgentRunLifecycleContext): Promise<AgentRunStartResult | undefined> {
-			const taskStart = await runTaskStart(ctx, hooksEnabled, createFactory, emitHookMessage)
-			if (taskStart?.stop) {
-				return taskStart
+			const runStart = wasAborted
+				? await runTaskResume(ctx, hooksEnabled, createFactory, emitHookMessage)
+				: hasStarted
+					? undefined
+					: await runTaskStart(ctx, hooksEnabled, createFactory, emitHookMessage)
+			wasAborted = false
+			hasStarted = true
+			if (runStart?.stop) {
+				return runStart
 			}
 			const promptSubmit = await runUserPromptSubmit(ctx, hooksEnabled, createFactory, emitHookMessage)
 			if (promptSubmit?.stop) {
 				return promptSubmit
 			}
-			const appendContext = [taskStart?.appendContext, promptSubmit?.appendContext]
+			const appendContext = [runStart?.appendContext, promptSubmit?.appendContext]
 				.filter((text): text is string => Boolean(text?.trim()))
 				.join("\n\n")
 			return appendContext ? { appendContext } : undefined
@@ -252,6 +261,7 @@ export function buildAgentHooks(
 		},
 
 		async afterRun(ctx): Promise<void> {
+			wasAborted = ctx.result.status === "aborted"
 			let hookName: "TaskComplete" | "TaskCancel" | undefined
 			let runningTs: number | undefined
 			try {
@@ -314,6 +324,60 @@ export function buildAgentHooks(
 				Logger.error("[HooksAdapter] afterRun hook failed:", error)
 			}
 		},
+	}
+}
+
+async function runTaskResume(
+	ctx: AgentRunLifecycleContext,
+	hooksEnabled: () => boolean,
+	createFactory: () => HookFactory,
+	emitHookMessage?: HookMessageEmitter,
+): Promise<AgentRunStartResult | undefined> {
+	let runningTs: number | undefined
+	try {
+		if (!hooksEnabled()) {
+			return undefined
+		}
+
+		const taskId = taskIdFromSnapshot(ctx.snapshot)
+		const factory = createFactory()
+		const runner = await factory.create("TaskResume", taskId)
+		if (runner.isNoOp) {
+			return undefined
+		}
+
+		const runningMsg = buildHookStatusMessage({ hookName: "TaskResume", status: "running" })
+		runningTs = runningMsg.ts
+		emitHookMessage?.(runningMsg)
+
+		const result = await runner.run({
+			taskId,
+			taskResume: {
+				taskMetadata: {
+					taskId,
+					ulid: "",
+					initialTask: latestUserPrompt(ctx),
+				},
+				previousState: {
+					lastMessageTs: String(ctx.snapshot.messages.at(-1)?.createdAt ?? Date.now()),
+					messageCount: String(ctx.snapshot.messages.length),
+					conversationHistoryDeleted: "false",
+				},
+			},
+		})
+
+		emitHookMessage?.(
+			buildHookStatusMessage({
+				hookName: "TaskResume",
+				status: result.cancel ? "cancelled" : "completed",
+				ts: runningTs,
+			}),
+		)
+		return mapStopOrContextResult(result)
+	} catch (error) {
+		emitHookMessage?.(buildHookStatusMessage({ hookName: "TaskResume", status: "failed", ts: runningTs }))
+		Logger.error("[HooksAdapter] beforeRun (TaskResume) hook failed:", error)
+		return undefined
 	}
 }
 

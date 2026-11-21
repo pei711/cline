@@ -70,6 +70,35 @@ describe("hooks-adapter task id threading", () => {
 		expect(mocks.create).toHaveBeenCalledWith("UserPromptSubmit", "conv-1")
 	})
 
+	it("runs TaskStart only once for a session", async () => {
+		const hooks = buildAgentHooks(stateManager)
+		await hooks.beforeRun?.({ snapshot } as never)
+		await hooks.beforeRun?.({ snapshot } as never)
+
+		expect(mocks.create.mock.calls.filter(([hookName]) => hookName === "TaskStart")).toHaveLength(1)
+	})
+
+	it("runs TaskResume after an aborted run instead of repeating TaskStart", async () => {
+		const hooks = buildAgentHooks(stateManager)
+		await hooks.beforeRun?.({ snapshot } as never)
+		await hooks.afterRun?.({ snapshot, result: { status: "aborted", outputText: "" } } as never)
+		await hooks.beforeRun?.({ snapshot } as never)
+
+		expect(mocks.create.mock.calls.filter(([hookName]) => hookName === "TaskStart")).toHaveLength(1)
+		expect(mocks.create).toHaveBeenCalledWith("TaskResume", "conv-1")
+		expect(runner.run).toHaveBeenCalledWith(
+			expect.objectContaining({
+				taskResume: expect.objectContaining({
+					taskMetadata: expect.objectContaining({ taskId: "conv-1" }),
+					previousState: expect.objectContaining({
+						messageCount: "1",
+						conversationHistoryDeleted: "false",
+					}),
+				}),
+			}),
+		)
+	})
+
 	it("passes the task id when creating the TaskComplete runner", async () => {
 		const hooks = buildAgentHooks(stateManager)
 		await hooks.afterRun?.({ snapshot, result: { status: "completed", outputText: "done" } } as never)
